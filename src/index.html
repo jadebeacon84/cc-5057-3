@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Relic Route Forge — 任务落位工作台</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <div class="brand">
+          <span class="mark">◆</span>
+          <div>
+            <h1>Relic Route Forge</h1>
+            <p>多区探险关卡 · 任务落位与可走通关证明</p>
+          </div>
+        </div>
+        <div class="top-actions">
+          <button id="btn-generate" class="primary">生成落位</button>
+          <button id="btn-reset" class="ghost">清除手动调整</button>
+          <button id="btn-invalid" class="ghost">载入故意不合法配置</button>
+        </div>
+      </header>
+
+      <main class="layout">
+        <aside class="panel left">
+          <div class="panel-head">
+            <h2>任务表</h2>
+            <span id="scene-badge" class="badge">Amber Reach</span>
+          </div>
+          <p id="scene-note" class="hint"></p>
+          <div id="step-list" class="step-list"></div>
+          <div class="panel-head sub">
+            <h3>钥匙与出口</h3>
+          </div>
+          <div id="key-list" class="key-list"></div>
+          <div class="panel-head sub">
+            <h3>硬条件 / 偏好</h3>
+          </div>
+          <div id="constraint-list" class="constraint-list"></div>
+        </aside>
+
+        <section class="stage-wrap">
+          <div id="stage"></div>
+          <div class="stage-overlay">
+            <div id="viewport-hud" class="hud"></div>
+            <div class="legend">
+              <span><i class="dot main"></i>主线</span>
+              <span><i class="dot side"></i>支线</span>
+              <span><i class="dot key"></i>钥匙</span>
+              <span><i class="dot exit"></i>单向出口</span>
+              <span><i class="line"></i>通关路线</span>
+            </div>
+          </div>
+          <div id="tooltip" class="tooltip hidden"></div>
+        </section>
+
+        <aside class="panel right">
+          <div class="tabs" id="result-tabs">
+            <button data-tab="spot" class="tab active">空间落位</button>
+            <button data-tab="proof" class="tab">任务路线</button>
+            <button data-tab="basis" class="tab">落位依据</button>
+            <button data-tab="issues" class="tab">异常</button>
+            <button data-tab="seeds" class="tab">多种子</button>
+          </div>
+          <div id="tab-body" class="tab-body"></div>
+        </aside>
+      </main>
+
+      <footer class="statusbar">
+        <span id="status-text">就绪</span>
+        <span id="status-metrics"></span>
+      </footer>
+    </div>
+
+    <div id="grid-tooltip" class="grid-tooltip hidden"></div>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

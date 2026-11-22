@@ -23,3 +23,6 @@ __pycache__/
 *.log
 .env
 .env.*
+
+# local headless-browser runtime (extracted .debs; machine specific)
+.browser-libs/
