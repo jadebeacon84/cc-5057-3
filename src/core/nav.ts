@@ -125,6 +125,41 @@ function pointOnPolyline(poly: Vec3[], t: number): Vec3 {
   return poly[poly.length - 1];
 }
 
+/**
+ * Arc-length position of the closest point on a polyline. Used to place a gate
+ * band across the full corridor width regardless of the link's orientation.
+ */
+export function polylineArcPosition(poly: Vec3[], p: Vec3): { arc: number; distance: number; total: number } {
+  if (poly.length === 0) return { arc: 0, distance: Infinity, total: 0 };
+  if (poly.length === 1) {
+    return { arc: 0, distance: Math.hypot(p[0] - poly[0][0], p[1] - poly[0][1], p[2] - poly[0][2]), total: 0 };
+  }
+  let bestArc = 0;
+  let bestDist = Infinity;
+  let walked = 0;
+  for (let i = 1; i < poly.length; i++) {
+    const a = poly[i - 1];
+    const b = poly[i];
+    const dx = b[0] - a[0];
+    const dy = b[1] - a[1];
+    const dz = b[2] - a[2];
+    const segLen = Math.hypot(dx, dy, dz);
+    const len2 = segLen * segLen;
+    let t = len2 === 0 ? 0 : ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy + (p[2] - a[2]) * dz) / len2;
+    t = Math.max(0, Math.min(1, t));
+    const qx = a[0] + dx * t;
+    const qy = a[1] + dy * t;
+    const qz = a[2] + dz * t;
+    const d = Math.hypot(p[0] - qx, p[1] - qy, p[2] - qz);
+    if (d < bestDist) {
+      bestDist = d;
+      bestArc = walked + segLen * t;
+    }
+    walked += segLen;
+  }
+  return { arc: bestArc, distance: bestDist, total: walked };
+}
+
 export function nearestPointOnPolyline(poly: Vec3[], p: Vec3): { point: Vec3; distance: number } {
   let best = poly[0] ?? [0, 0, 0];
   let bestD = Infinity;
@@ -262,23 +297,27 @@ export function buildGrid(level: LevelDef): NavGrid {
     carveLink(cells, minX, minZ, cols, rows, cs, link, get);
   }
 
-  // Gate cells: block the doorway while closed.
+  // Gate cells: block the doorway while closed. The band is centred on the
+  // midpoint of the link and spans the link's full width, measured in the
+  // link's own frame (arc along the polyline, lateral offset from it). A fixed
+  // x/z window would only seal z-running links and let wide or x-running
+  // corridors be skirted around the gate.
   const gateCells = new Map<string, number[]>();
   for (const link of level.links) {
     if (!link.gate) continue;
-    const mid = pointOnPolyline(link.polyline, 0.5);
+    const total = polylineLength(link.polyline);
+    const halfBand = Math.max(cs * 0.9, link.width * 0.25);
+    const lateralReach = link.width / 2 + cs * 0.6;
     const list: number[] = [];
     for (let cz = 0; cz < rows; cz++) {
       for (let cx = 0; cx < cols; cx++) {
         const c = cells[cz * cols + cx];
         if (!c || !c.walkable) continue;
-        const near =
-          Math.abs(c.z - mid[2]) <= cs * 1.1 &&
-          Math.abs(c.x - mid[0]) <= link.width / 2 + cs * 0.6;
-        if (near) {
-          c.gate = link.gate;
-          list.push(cz * cols + cx);
-        }
+        const hit = polylineArcPosition(link.polyline, [c.x, c.y, c.z]);
+        if (Math.abs(hit.arc - total * 0.5) > halfBand) continue;
+        if (hit.distance > lateralReach) continue;
+        c.gate = link.gate;
+        list.push(cz * cols + cx);
       }
     }
     gateCells.set(link.gate, list);

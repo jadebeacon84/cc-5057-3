@@ -1,21 +1,24 @@
 import './styles.css';
-import { DEMO_LEVEL, makeInvalidLevel } from './core/demoLevel.ts';
+import { DEMO_LEVEL, makeInvalidLevel, makeOrderingLevel } from './core/demoLevel.ts';
 import { placeLevel, evaluateManual } from './core/placement.ts';
 import { buildGrid } from './core/nav.ts';
-import type { LevelDef, PlacementResult } from './core/types.ts';
+import type { Conflict, LevelDef, PlacementResult } from './core/types.ts';
 import { Viewport } from './viewport.ts';
 import { renderTab, type TabId } from './render.ts';
 import { stepCard, spatialSvg, clear } from './ui.ts';
 
+type SceneId = 'demo' | 'invalid' | 'ordering';
+
 class App {
   private level: LevelDef = structuredClone(DEMO_LEVEL);
   private result: PlacementResult | null = null;
-  private validResult: PlacementResult | null = null;
+  private lastAccepted: PlacementResult | null = null;
+  private rejection: { conflicts: Conflict[]; metrics: PlacementResult['metrics'] } | null = null;
   private viewport: Viewport;
   private tab: TabId = 'spot';
   private selected: string | null = null;
   private routeIndex: number | null = null;
-  private invalid = false;
+  private scene: SceneId = 'demo';
   private override: Record<string, { x: number; z: number }> = {};
   private busy = false;
 
@@ -38,6 +41,7 @@ class App {
   private bindChrome() {
     document.getElementById('btn-generate')!.addEventListener('click', () => this.generate());
     document.getElementById('btn-invalid')!.addEventListener('click', () => this.toggleInvalid());
+    document.getElementById('btn-ordering')!.addEventListener('click', () => this.loadOrdering());
     document.getElementById('btn-reset')!.addEventListener('click', () => this.resetOverrides());
     const tabs = document.getElementById('result-tabs')!;
     tabs.addEventListener('click', (e) => {
@@ -55,21 +59,36 @@ class App {
       return;
     }
     this.override = {};
+    this.rejection = null;
     this.generate();
     this.setStatus('已清除手动调整，恢复求解器落位。');
   }
 
   private toggleInvalid() {
-    this.invalid = !this.invalid;
-    this.level = this.invalid ? makeInvalidLevel() : structuredClone(DEMO_LEVEL);
+    this.scene = this.scene === 'invalid' ? 'demo' : 'invalid';
+    this.loadScene();
+  }
+
+  private loadOrdering() {
+    this.scene = this.scene === 'ordering' ? 'demo' : 'ordering';
+    this.loadScene();
+  }
+
+  private loadScene() {
+    this.level =
+      this.scene === 'invalid' ? makeInvalidLevel() : this.scene === 'ordering' ? makeOrderingLevel() : structuredClone(DEMO_LEVEL);
     this.override = {};
-    this.validResult = null;
+    this.lastAccepted = null;
+    this.rejection = null;
     this.selected = null;
     this.routeIndex = null;
     this.viewport.buildScene(this.level);
-    const btn = document.getElementById('btn-invalid')!;
-    btn.textContent = this.invalid ? '返回合法场景' : '载入故意不合法配置';
-    btn.classList.toggle('danger', this.invalid);
+    const invalidBtn = document.getElementById('btn-invalid')!;
+    invalidBtn.textContent = this.scene === 'invalid' ? '返回合法场景' : '载入故意不合法配置';
+    invalidBtn.classList.toggle('danger', this.scene === 'invalid');
+    const orderingBtn = document.getElementById('btn-ordering')!;
+    orderingBtn.textContent = this.scene === 'ordering' ? '返回合法场景' : '载入先后约束案例';
+    orderingBtn.classList.toggle('danger', this.scene === 'ordering');
     this.renderLeft();
     this.generate();
   }
@@ -77,34 +96,37 @@ class App {
   private generate() {
     if (this.busy) return;
     this.busy = true;
-    this.setStatus(this.invalid ? '求解故意不合法配置…' : '求解落位与可走证明…');
+    this.setStatus(this.scene === 'demo' ? '求解落位与可走证明…' : '求解当前案例…');
     // Let the status paint before the synchronous solver runs.
     setTimeout(() => {
       try {
+        this.rejection = null;
         const res = placeLevel(this.level, { seeds: 8 });
-        if (this.invalid) {
-          this.result = res;
-        } else {
-          this.result = this.override && Object.keys(this.override).length
-            ? this.applyOverrides(res)
-            : res;
-          this.validResult = this.result;
+        this.result = this.override && Object.keys(this.override).length ? this.applyOverrides(res) : res;
+        // A rejected manual click must leave the previously accepted plan
+        // visible, as the conflict message promises. The rejection is carried as
+        // a separate hard conflict so the feedback still reaches the editor.
+        const rejected = this.result.conflicts.filter((c) => c.code.startsWith('MANUAL_'));
+        if (rejected.length && this.lastAccepted) {
+          this.rejection = { conflicts: rejected, metrics: { ...this.lastAccepted.metrics, ...this.result.metrics } };
+          this.result = this.lastAccepted;
+        } else if (this.result.ok) {
+          this.lastAccepted = this.result;
         }
         this.viewport.showResult(this.result, this.selected, this.routeIndex);
-        const manual = this.result.conflicts.find((c) => c.code.startsWith('MANUAL_'));
+        const manual = this.rejection?.conflicts[0];
         this.setStatus(
-          this.result.ok
-            ? `落位成立：${this.result.proof.route.stops.length} 站，${this.result.proof.route.totalDistance.toFixed(0)} m 步行${Object.keys(this.override).length ? '（含手动调整）' : ''}`
-            : manual
-              ? `手动落位被拒绝：${
-                  manual.code === 'MANUAL_APPROACH_BLOCKED' ? '交互站位已被其它对象占用' : '该格不满足硬条件'
-                }（详见「异常」页）`
+          manual
+            ? `手动落位被拒绝：${
+                manual.code === 'MANUAL_APPROACH_BLOCKED' ? '交互站位已被其它对象占用' : '该格不满足硬条件'
+              }（详见「异常」页；保留上一版落位）`
+            : this.result.ok
+              ? `落位成立：${this.result.proof.route.stops.length} 站，${this.result.proof.route.totalDistance.toFixed(0)} m 步行${Object.keys(this.override).length ? '（含手动调整）' : ''}`
               : `未成立：${this.result.conflicts.filter((c) => c.severity === 'hard').length} 条硬冲突`
         );
-        const m = this.result.metrics;
-        const manualCount = this.result.conflicts.filter((c) => c.code.startsWith('MANUAL_')).length;
+        const m = this.rejection?.metrics ?? this.result.metrics;
         document.getElementById('status-metrics')!.textContent =
-          `${m.attempts} attempts · ${m.candidatesExamined} candidates · ${m.searchMs} ms · soft ${m.softCost.toFixed(1)}${manualCount ? ` · 手动拒绝 ${manualCount}` : ''}`;
+          `${m.attempts} attempts · ${m.candidatesExamined} candidates · ${m.searchMs} ms · soft ${m.softCost.toFixed(1)}${this.rejection ? ` · 手动拒绝 ${this.rejection.conflicts.length}` : ''}`;
         this.renderLeft();
         this.render();
       } catch (err) {
@@ -138,7 +160,7 @@ class App {
   }
 
   private pickCell(x: number, z: number) {
-    if (this.invalid) {
+    if (this.scene === 'invalid') {
       this.setStatus('不合法场景只用于演示冲突，不会接受手动落位调整。');
       return;
     }
@@ -256,19 +278,28 @@ class App {
     }
 
     const badge = document.getElementById('scene-badge')!;
-    badge.textContent = this.invalid ? '故意不合法' : 'Amber Reach';
-    badge.classList.toggle('fail', this.invalid);
+    badge.textContent =
+      this.scene === 'invalid' ? '故意不合法' : this.scene === 'ordering' ? 'Ordering Lab' : 'Amber Reach';
+    badge.classList.toggle('fail', this.scene === 'invalid');
     const note = document.getElementById('scene-note')!;
-    note.textContent = this.invalid
-      ? '该配置包含：依赖环、硬区域冲突、空距离窗口、钥匙自锁。工具会逐条命名，而不是丢掉支线。'
-      : this.level.notes?.[0] ?? '';
+    note.textContent =
+      this.scene === 'invalid'
+        ? '该配置包含：依赖环、硬区域冲突、空距离窗口、钥匙自锁。工具会逐条命名，而不是丢掉支线。'
+        : this.scene === 'ordering'
+          ? '最小多区先后约束案例：hub → 单格长廊 → 门控 vault → 单向出口。选中任务点后点击 vault 地面即可重新布置并生成。'
+          : this.level.notes?.[0] ?? '';
   }
 
   private render() {
     const body = document.getElementById('tab-body')!;
+    // Rejections are shown alongside the kept plan so the failure is visible
+    // in the issues tab without hiding the last accepted layout.
+    const shown = this.result && this.rejection
+      ? { ...this.result, ok: false, conflicts: [...this.result.conflicts, ...this.rejection.conflicts] }
+      : this.result;
     renderTab(this.tab, body, {
       level: this.level,
-      result: this.result,
+      result: shown,
       selected: this.selected,
       routeIndex: this.routeIndex,
       onSelect: (id) => this.select(id, true),
@@ -289,12 +320,14 @@ class App {
         this.render();
       },
       onSeed: (seed) => {
-        if (this.invalid) {
-          this.setStatus('不合法场景没有成立的种子。');
+        if (this.scene !== 'demo') {
+          this.setStatus(this.scene === 'invalid' ? '不合法场景没有成立的种子。' : '先后约束案例只有一个任务点，种子切换不适用。');
           return;
         }
         const res = placeLevel(this.level, { seeds: 8, onlySeed: seed });
         this.result = res;
+        this.lastAccepted = res.ok ? res : null;
+        this.rejection = null;
         this.override = {};
         this.selected = null;
         this.viewport.showResult(res, null, null);

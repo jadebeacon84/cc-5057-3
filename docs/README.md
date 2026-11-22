@@ -28,6 +28,19 @@ npm run dev
 - **生成落位**：重新求解（含手动调整）。
 - **清除手动调整**：回到纯求解器结果。
 - **载入故意不合法配置**：切换到内置的故障场景（依赖环、min>max、钥匙落在自己的门后、seal 被硬性要求放在不存在的 `hall` 区域、硬距离冲突），异常页逐条说明；再点一次返回合法场景。
+- **载入先后约束案例**：切换到 `makeOrderingLevel()` 的最小多区场景（hub → 单格宽长廊 → 门控 vault → 单向出口，两把钥匙一道 pickup 任务）。在编辑视窗里选中“Take the vault seal”，点击 vault 地面即可重新布置，右侧“空间落位/任务路线”立即用修补后的内核重算；点击 vault 以外的格子会被拒绝，状态栏与“异常”页点名 `MANUAL_CELL_REJECTED`，并保留上一版已接受的落位供对照。再点一次返回合法场景。
+
+### 怎么启动界面
+
+界面不需要额外构建步骤，Vite 开发服务器就是入口：
+
+```bash
+npm install
+npm run dev
+# 浏览器打开 http://localhost:5173/
+```
+
+生产预览用 `npm run build && npm run preview`（默认 http://localhost:4173/）。无头回归需要先启动 `npm run dev`，再运行 `node scripts/ui-ordering.mjs` 与 `node scripts/ui-smoke.mjs`，两者都会断言结果并写截图到 `artifacts/`。
 
 ## 命令行（辅助）
 
@@ -44,11 +57,27 @@ npm run place -- --out artifacts/run.txt
 ## 验证方式
 
 ```bash
-npm test          # 21 个核心测试
+npm test          # 31 个核心 + 先后约束回归测试
 npm run build     # vite 生产构建
 ```
 
-无头界面检查（需要本机 Chromium；仓库另附 `scripts/ui-smoke.mjs`、`scripts/ui-interactions.mjs`，截图写入 `artifacts/`）。
+`tests/ordering.test.mjs` 专门覆盖先后约束漏检，使用 `makeOrderingLevel()` 的最小多区场景（hub → 单向走廊 → 门控 vault → 出口）：
+
+- **门带全宽**：关门时走廊整幅被封，不能从两侧绕过。
+- **离线枚举 vs 运行期跟踪**：独立的状态闭包与 `planRoute` 的逐站证明必须给出相同的可达结论。
+- **钥匙与通道互相依赖**：双方都在对方门后时，两把钥匙都报 `KEY_SELF_LOCKED`，不伪造“两把都拿到”的状态。
+- **先拾取后通过 / 先封路后通过**：可消耗 pickup 取走后释放格；talk/inspect 等永久对象压住唯一通道时报 `OBJECT_SEALS_PATH`，逆序依赖报 `ROUTE_STATE`。
+- **旧样例与复跑**：合法场景 12 站跑到底，相同种子复跑得到相同的站点顺序与落位；不合法场景保留可定位的失败证据。
+- **界面驱动**：`scripts/ui-ordering.mjs` 在真实编辑器里载入该案例、点 vault 地面重新布置并断言路线重算（35 m → 33 m），再点 hub 触发 `MANUAL_CELL_REJECTED` 并断言上一版落位仍可见，最后断言重置与返回合法场景都成立。
+
+无头界面检查（需要本机 Chromium；仓库另附 `scripts/ui-smoke.mjs`、`scripts/ui-interactions.mjs`，截图写入 `artifacts/`）。若系统 Chromium 缺少共享库，可用仓库内解压的 sysroot：
+
+```bash
+npm run dev &   # 监听 http://localhost:5173/
+LD_LIBRARY_PATH=$PWD/.browser-libs/sysroot/usr/lib/aarch64-linux-gnu:$PWD/.browser-libs/sysroot/lib/aarch64-linux-gnu \
+PLAYWRIGHT_CHROMIUM_EXECUTABLE=$HOME/.cache/ms-playwright/chromium_headless_shell-1194/chrome-linux/headless_shell \
+node scripts/ui-smoke.mjs
+```
 
 ## 为什么不是“钥匙迷宫换皮”
 
@@ -79,8 +108,8 @@ npm run build     # vite 生产构建
 
 ```
 src/core/types.ts            关卡、落位、证明、冲突的数据模型
-src/core/nav.ts              高度感知 4 邻接导航网格、道具腐蚀、门格、视线、寻路
-src/core/demoLevel.ts        合法场景 + 故意不合法场景
+src/core/nav.ts              高度感知 4 邻接导航网格、道具腐蚀、门带（全宽）、视线、寻路
+src/core/demoLevel.ts        合法场景 + 故意不合法场景 + 先后约束最小复现
 src/core/staticAnalysis.ts   Tarjan 环检测、拓扑序、静态冲突（距离窗口、门可解锁性等）
 src/core/placement.ts        候选空间、钥匙安全格、多种子落位、软/硬目标、手动重算
 src/core/route.ts            精确状态空间规划器 + 逐站证明 + 不可达定位
@@ -89,11 +118,14 @@ src/render.ts                五个结果页签
 src/ui.ts                    卡片与小地图
 src/main.ts                  应用装配、手动调整、种子切换、异常联动
 scripts/place.mjs            辅助 CLI
+scripts/ui-smoke.mjs         无头界面巡检（截图）
+scripts/ui-ordering.mjs      先后约束案例的界面驱动回归（断言布置/生成/拒绝反馈）
 tests/core.test.mjs          核心验证
+tests/ordering.test.mjs      先后约束、门带、钥匙互相依赖与复跑回归
 ```
 
 ## 验证轨迹（示例）
 
-合法场景（`npm run place -- --seeds 4`）：12 站、159.6 m、walk-only；先取 `vine-key`（garden）再进 tunnel 取 `sun-key`，再回到 cliff 取 `sun-shard`，最后进 vault 完成 `seal` 与 `escape`。路线段显示真实爬升（0 → 2.4 m → -1.2 m）。
+合法场景（`npm run place -- --seeds 4`）：12 站、157.6 m、walk-only；先取 `vine-key`（garden）再进 tunnel 取 `sun-key`，再回到 cliff 取 `sun-shard`，最后进 vault 完成 `seal` 与 `escape`。路线段显示真实爬升（0 → 2.4 m → -1.2 m）。
 
 不合法场景（`npm run place -- --invalid`）：8 条硬冲突，分别定位到依赖环、空距离窗口、钥匙在自己的门后、以及因此无法完成的 `hermit` / `herb` / `escape` / `sun-key`，另有 `seal ↔ exit` 硬距离冲突；没有静默删掉任何支线。

@@ -18,7 +18,6 @@ import {
   closedGateSet,
   nearestWalkable,
   worldToIndex,
-  findPath,
   lineOfSight,
 } from './nav.ts';
 import { keyGateOrderConflicts, staticConflicts, topoOrder } from './staticAnalysis.ts';
@@ -95,7 +94,12 @@ function posOfIndex(grid: NavGrid, idx: number): Vec3 {
   return cellWorld(grid, idx);
 }
 
-/** A cell is critical if blocking it separates two of its neighbours. */
+/**
+ * A cell is critical if removing it splits its own walkable neighbours into
+ * more than one connected group. Checking only the first two neighbours misses
+ * a cut at a T-junction, where blocking the cell disconnects the third arm
+ * while the first two still touch each other.
+ */
 function isCritical(grid: NavGrid, idx: number, blocked: ReadonlySet<number>): boolean {
   const c = grid.cells[idx];
   if (!c) return true;
@@ -111,13 +115,12 @@ function isCritical(grid: NavGrid, idx: number, blocked: ReadonlySet<number>): b
     nbrs.push(ni);
   }
   if (nbrs.length <= 1) return false;
-  // BFS from first neighbour to second avoiding idx.
-  const target = nbrs[1];
+  // BFS from the first neighbour avoiding idx; every other neighbour must be
+  // in the same component, otherwise idx is a separator.
   const seen = new Set<number>([nbrs[0], idx]);
   const queue = [nbrs[0]];
   while (queue.length) {
     const cur = queue.pop()!;
-    if (cur === target) return false;
     const cc = grid.cells[cur]!;
     for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
       const nx = cc.cx + dx;
@@ -131,7 +134,7 @@ function isCritical(grid: NavGrid, idx: number, blocked: ReadonlySet<number>): b
       queue.push(ni);
     }
   }
-  return true;
+  return nbrs.some((n) => !seen.has(n));
 }
 
 interface CandidateSpace {
@@ -395,17 +398,36 @@ interface ReachInfo {
  * Compute key placement safety from movement state, not geometric distance.
  * A key may only be hidden in a cell reachable in some state where that key has
  * not yet been collected (otherwise the key would be behind its own gate).
+ *
+ * The item-set enumeration is only sound if a mask transition is taken for a
+ * key that is actually collectable in the current state. Expanding every key
+ * unconditionally fabricates states such as "hold A and B" even when A is
+ * behind B's gate and B behind A's gate; that over-approximation then labels a
+ * mutually locked hiding cell as safe. We therefore expand a key only when at
+ * least one of its allowed cells is reachable with the gates currently open.
  */
 function reachabilityForKeys(level: LevelDef, grid: NavGrid): ReachInfo {
-  const gates = new Map<string, string[]>();
-  for (const k of level.keys) gates.set(k.id, k.unlocks);
   const cellsByMask = new Map<number, Set<number>>();
   const reachableMasks: number[] = [];
   const reachableCells = new Set<number>();
   const closureNotes: string[] = [];
   const seenMasks = new Set<number>();
   const queue: Array<{ mask: number; note: string }> = [{ mask: 0, note: 'entry, all gates closed' }];
-  const maskCount = 1 << level.keys.length;
+
+  const gateCells = new Set<number>();
+  for (const list of grid.gateCells.values()) for (const i of list) gateCells.add(i);
+
+  const allowedFor = (key: KeyDef, idx: number): boolean => {
+    const c = grid.cells[idx];
+    if (!c || !c.walkable || !c.zoneId) return false;
+    if (gateCells.has(idx)) return false;
+    const forced = level.config?.forcedKeyZones?.[key.id];
+    if (forced && c.zoneId !== forced) return false;
+    // Collectable means reachable *and* standable: a cell with no approach
+    // inside the key's radius can never actually yield the key, so taking that
+    // state transition would again over-approximate the item set.
+    return findKeyApproach(grid, c, key.radius, gateCells) !== null;
+  };
 
   while (queue.length) {
     const { mask, note } = queue.shift()!;
@@ -441,10 +463,16 @@ function reachabilityForKeys(level: LevelDef, grid: NavGrid): ReachInfo {
     for (let i = 0; i < level.keys.length; i++) {
       if (mask & (1 << i)) continue;
       const key = level.keys[i];
-      // A key becomes collectable if any of its candidate cells is in this reach
-      // set; key positions are chosen within this set, so the mask transition is
-      // valid by construction.
-      if (maskCount <= 1) continue;
+      // Only take a transition that the level can actually make: at least one
+      // legal hiding cell for this key must be walkable right now.
+      let collectable = false;
+      for (const idx of cells) {
+        if (allowedFor(key, idx)) {
+          collectable = true;
+          break;
+        }
+      }
+      if (!collectable) continue;
       queue.push({ mask: mask | (1 << i), note: `after ${key.label}` });
     }
   }
@@ -569,7 +597,7 @@ function buildKeySpace(level: LevelDef, grid: NavGrid): KeyCandidateSpace {
         pos,
         approachPos: cellPos(grid, approach.idx),
         reachStateNote: safe
-          ? `reachable before this key is collected (state: ${describeReachState(level, reach, idx)})`
+          ? `reachable before this key is collected (state: ${describeReachState(level, reach, idx, ki)})`
           : `only reachable after opening ${key.unlocks.join(', ')} — rejected`,
         safe,
         score,
@@ -583,12 +611,15 @@ function buildKeySpace(level: LevelDef, grid: NavGrid): KeyCandidateSpace {
   return { byKey, safeCells, unsafeCells, closureNotes: reach.closureNotes, reachInfo: reach };
 }
 
-function describeReachState(level: LevelDef, reach: ReachInfo, idx: number): string {
+function describeReachState(level: LevelDef, reach: ReachInfo, idx: number, keyIndex: number): string {
   const masks: string[] = [];
   for (const [mask, cells] of reach.cellsByMask) {
+    // A state that already holds this key cannot be the state in which it is
+    // picked up; including it would overstate the basis for the placement.
+    if (mask & (1 << keyIndex)) continue;
     if (cells.has(idx)) masks.push(keyMaskLabel(level, mask));
   }
-  if (!masks.length) return 'unreachable';
+  if (!masks.length) return 'unreachable before collection';
   return `cell reachable under {${masks.join(' / ')}}`;
 }
 
@@ -1027,7 +1058,7 @@ function evaluateAttempt(
     const placement = placements.find((p) => p.stepId === s.id);
     const key = keys.find((k) => k.keyId === s.id);
     const zoneId = s.zoneId ?? placement?.zoneId ?? key?.zoneId ?? '?';
-    const code = s.gate ? 'KEY_SELF_LOCKED' : stepPlacementReachable(level, grid, s.id, placements, keys) ? 'ROUTE_STATE' : 'STEP_UNREACHABLE';
+    const code = classifyStuck(level, grid, s, placements, keys);
     conflicts.push({
       code,
       severity: 'hard',
@@ -1036,9 +1067,11 @@ function evaluateAttempt(
       suggestion:
         code === 'KEY_SELF_LOCKED'
           ? `Move “${s.id}” to a zone reachable before the gate opens; the exit-side zone is only reachable after the gate.`
-          : code === 'STEP_UNREACHABLE'
-            ? 'Place the object with a reachable approach cell, or widen the interaction radius; check that props do not seal the room.'
-            : 'The dependency order and open-gate state never line up. Check keys and requires together.',
+          : code === 'OBJECT_SEALS_PATH'
+            ? 'An object that stays in the world blocks the only corridor. Use a consumable pickup there, widen the corridor, or place the object on a cell that is not a cut vertex.'
+            : code === 'STEP_UNREACHABLE'
+              ? 'Place the object with a reachable approach cell, or widen the interaction radius; check that props do not seal the room.'
+              : 'The dependency order and open-gate state never line up. Check keys and requires together.',
       at: [placement?.objectPos, key?.pos].filter(Boolean) as Vec3[],
     });
   }
@@ -1111,32 +1144,102 @@ function localitySummary(
   return { penalty: round(penalty) };
 }
 
-function stepPlacementReachable(
+/**
+ * Name the real cause of a stuck stop instead of falling back to a catch-all.
+ * - KEY_SELF_LOCKED: the stop is a key and the diagnosis found its gate.
+ * - ROUTE_STATE: every object clears, but the dependency/gate order never lines
+ *   up (e.g. exit requires a corridor stop that requires the exit).
+ * - OBJECT_SEALS_PATH: the approach is reachable ignoring object bodies under a
+ *   gate state the level can actually reach, but an object that never clears
+ *   sits on the only route. This is the permanent half of the pickup-then-block
+ *   vs block-then-pickup comparison.
+ * - STEP_UNREACHABLE: not reachable even with all objects removed.
+ */
+function classifyStuck(
   level: LevelDef,
   grid: NavGrid,
-  id: string,
+  stuck: { id: string; gate?: string; reason: string },
   placements: Placement[],
   keys: KeyPlacement[]
-): boolean {
-  const step = level.steps.find((s) => s.id === id);
-  const placement = placements.find((p) => p.stepId === id);
-  if (!step || !placement) return false;
-  const target = worldToIndex(grid, placement.approachPos[0], placement.approachPos[2]);
-  for (const mask of [0, (1 << level.keys.length) - 1]) {
-    const gates = keyOpenGates(level, mask);
-    const path = findPath(grid, grid.entryCell, target, gates, blockedObjects(placements, keys, id));
-    if (path.found) return true;
+): string {
+  if (stuck.gate) return 'KEY_SELF_LOCKED';
+  if (/dependencies never become satisfiable/.test(stuck.reason)) return 'ROUTE_STATE';
+  const placement = placements.find((p) => p.stepId === stuck.id);
+  const key = keys.find((k) => k.keyId === stuck.id);
+  const target = placement
+    ? worldToIndex(grid, placement.approachPos[0], placement.approachPos[2])
+    : key
+      ? worldToIndex(grid, key.approachPos[0], key.approachPos[2])
+      : -1;
+  if (target < 0) return 'STEP_UNREACHABLE';
+
+  // States the level can actually reach when object bodies are ignored. Using
+  // "all gates open" as the only probe would blame an object for a stop that is
+  // really behind a gate no reachable key state ever opens.
+  const reachableMasks = reachableKeyMasks(level, grid);
+  for (const mask of reachableMasks) {
+    if (floodCells(grid, keyOpenGates(level, mask)).has(target)) return 'OBJECT_SEALS_PATH';
   }
-  return false;
+  const allGates = keyOpenGates(level, (1 << level.keys.length) - 1);
+  if (floodCells(grid, allGates).has(target)) return 'ROUTE_STATE';
+  return 'STEP_UNREACHABLE';
 }
 
-function blockedObjects(placements: Placement[], keys: KeyPlacement[], exceptStep: string): Set<number> {
+/** Key masks reachable from the entry when object bodies are ignored. */
+function reachableKeyMasks(level: LevelDef, grid: NavGrid): number[] {
+  const gateCells = new Set<number>();
+  for (const list of grid.gateCells.values()) for (const i of list) gateCells.add(i);
+  const allowedFor = (key: KeyDef, idx: number): boolean => {
+    const c = grid.cells[idx];
+    if (!c || !c.walkable || !c.zoneId || gateCells.has(idx)) return false;
+    const forced = level.config?.forcedKeyZones?.[key.id];
+    if (forced && c.zoneId !== forced) return false;
+    return findKeyApproach(grid, c, key.radius, gateCells) !== null;
+  };
+  const seen = new Set<number>();
+  const out: number[] = [];
+  const queue = [0];
+  while (queue.length) {
+    const mask = queue.pop()!;
+    if (seen.has(mask)) continue;
+    seen.add(mask);
+    out.push(mask);
+    const cells = floodCells(grid, keyOpenGates(level, mask));
+    for (let i = 0; i < level.keys.length; i++) {
+      if (mask & (1 << i)) continue;
+      const key = level.keys[i];
+      for (const idx of cells) {
+        if (allowedFor(key, idx)) {
+          queue.push(mask | (1 << i));
+          break;
+        }
+      }
+    }
+  }
+  return out;
+}
+
+function floodCells(grid: NavGrid, openGates: ReadonlySet<string>): Set<number> {
+  const closed = closedGateSet(grid, openGates);
   const out = new Set<number>();
-  // Caller does not pass the grid; this helper is only used for a coarse check
-  // and the exact test is done by planRoute. Return empty to avoid false claims.
-  void placements;
-  void keys;
-  void exceptStep;
+  const queue = [grid.entryCell];
+  out.add(grid.entryCell);
+  while (queue.length) {
+    const cur = queue.pop()!;
+    const cc = grid.cells[cur];
+    if (!cc) continue;
+    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
+      const nx = cc.cx + dx;
+      const nz = cc.cz + dz;
+      if (nx < 0 || nz < 0 || nx >= grid.cols || nz >= grid.rows) continue;
+      const ni = nz * grid.cols + nx;
+      const nc = grid.cells[ni];
+      if (!nc || !nc.walkable || out.has(ni) || closed.has(ni)) continue;
+      if (Math.abs(nc.y - cc.y) > grid.maxStep + 1e-6) continue;
+      out.add(ni);
+      queue.push(ni);
+    }
+  }
   return out;
 }
 

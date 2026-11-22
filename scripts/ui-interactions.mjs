@@ -4,7 +4,12 @@ import { mkdirSync } from 'node:fs';
 const OUT = 'artifacts';
 mkdirSync(OUT, { recursive: true });
 
-const browser = await chromium.launch();
+const browser = await chromium.launch({
+  args: ['--no-sandbox', '--disable-gpu'],
+  ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE
+    ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE }
+    : {}),
+});
 const page = await browser.newPage({ viewport: { width: 1600, height: 980 } });
 const errors = [];
 page.on('pageerror', (e) => errors.push(`pageerror: ${e.message}`));
@@ -12,7 +17,7 @@ page.on('console', (m) => {
   if (m.type() === 'error') errors.push(`console: ${m.text()}`);
 });
 
-await page.goto('http://127.0.0.1:5173/', { waitUntil: 'networkidle' });
+await page.goto('http://localhost:5173/', { waitUntil: 'networkidle' });
 const ready = async () =>
   page.waitForFunction(() => {
     const t = document.getElementById('status-text')?.textContent ?? '';

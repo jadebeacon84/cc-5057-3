@@ -122,13 +122,11 @@ export function planRoute(
   const stepIndex = new Map(steps.map((s, i) => [s.id, i]));
   const keyIndex = new Map(level.keys.map((k, i) => [k.id, i]));
 
-  const reserved = new Set<number>();
   const stops: PlanStop[] = [];
   for (const p of placements) {
     const oc = idxOf(grid, p.objectCell);
     const ac = idxOf(grid, p.approachCell);
     if (oc < 0 || ac < 0) continue;
-    reserved.add(oc);
     const step = steps[stepIndex.get(p.stepId)!];
     stops.push({
       kind: 'step',
@@ -150,7 +148,6 @@ export function planRoute(
     const oc = idxOf(grid, k.cell);
     const ac = idxOf(grid, k.approachCell);
     if (oc < 0 || ac < 0) continue;
-    reserved.add(oc);
     const key = level.keys[keyIndex.get(k.keyId)!];
     stops.push({
       kind: 'key',
@@ -173,6 +170,32 @@ export function planRoute(
     });
   }
 
+  // Objects occupy their cell, but only while they are still in play. A pickup
+  // or chest disappears when its step completes, and a collected key is gone;
+  // a talked-to/hermit or a placed seal stays and keeps blocking. Treating
+  // every object as a permanent wall made "pick it up first, then walk through"
+  // look impossible. The block set therefore depends on (done, keyMask).
+  const removedOnCompletion = new Map<string, boolean>();
+  for (const s of steps) removedOnCompletion.set(s.id, s.interaction.kind === 'pickup' || s.interaction.kind === 'chest');
+  const objectOwners = new Map<number, { kind: 'step' | 'key'; id: string; clears: boolean }>();
+  for (const stop of stops) {
+    const clears = stop.kind === 'key' ? true : removedOnCompletion.get(stop.id) === true;
+    objectOwners.set(stop.objectCell, { kind: stop.kind, id: stop.id, clears });
+  }
+  const blockedFor = (done: number, keyMask: number): Set<number> => {
+    const out = new Set<number>();
+    for (const [cell, owner] of objectOwners) {
+      if (owner.kind === 'step') {
+        const si = stepIndex.get(owner.id)!;
+        if (!owner.clears || !(done & (1 << si))) out.add(cell);
+      } else {
+        const ki = keyIndex.get(owner.id)!;
+        if (!(keyMask & (1 << ki))) out.add(cell);
+      }
+    }
+    return out;
+  };
+
   const entryCell = grid.entryCell;
   const exitCell = nearestWalkable(grid, level.exitPoint[0], level.exitPoint[2], 6);
   if (entryCell < 0) {
@@ -191,12 +214,21 @@ export function planRoute(
   nodes.forEach((s, i) => nodeByKey.set(`${s.kind}:${s.id}`, i));
 
   const pathCache = new Map<string, ReturnType<typeof findPath>>();
-  const edge = (fromCell: number, toCell: number, gates: Set<string>): ReturnType<typeof findPath> => {
+  const edge = (
+    fromCell: number,
+    toCell: number,
+    gates: Set<string>,
+    done: number,
+    keyMask: number
+  ): ReturnType<typeof findPath> => {
     const gk = [...gates].sort().join(',');
-    const cacheKey = `${fromCell}>${toCell}|${gk}`;
+    // The walkable set shrinks as pickups and keys clear their cells, so the
+    // state must be part of the cache key or a later state would reuse an
+    // earlier state's (correct at the time) blocked path.
+    const cacheKey = `${fromCell}>${toCell}|${gk}|${done}|${keyMask}`;
     let v = pathCache.get(cacheKey);
     if (!v) {
-      v = findPath(grid, fromCell, toCell, gates, reserved);
+      v = findPath(grid, fromCell, toCell, gates, blockedFor(done, keyMask));
       pathCache.set(cacheKey, v);
     }
     return v;
@@ -228,7 +260,7 @@ export function planRoute(
     const posCell = node < 0 ? entryCell : nodes[node].standCell;
 
     if (done === allDone) {
-      const p = edge(posCell, exitCell, gates);
+      const p = edge(posCell, exitCell, gates, done, keyMask);
       if (p.found) {
         const next = `X|${done}|${keyMask}`;
         const cost = item.cost + p.distance;
@@ -251,7 +283,7 @@ export function planRoute(
         const ki = keyIndex.get(stop.id)!;
         if (keyMask & (1 << ki)) continue;
       }
-      const path = edge(posCell, stop.standCell, gates);
+      const path = edge(posCell, stop.standCell, gates, done, keyMask);
       if (!path.found) continue;
       const nextDone = stop.kind === 'step' ? done | (1 << stepIndex.get(stop.id)!) : done;
       const nextKey = stop.kind === 'key' ? keyMask | (1 << keyIndex.get(stop.id)!) : keyMask;
@@ -267,7 +299,7 @@ export function planRoute(
   }
 
   if (!goalState) {
-    const stuck = diagnose(level, grid, stops, entryCell, reserved);
+    const stuck = diagnose(level, grid, stops, entryCell, blockedFor);
     const proof = failProof(
       stuck.length
         ? `No walk-only completion exists. ${stuck.length} stop(s) can never be reached: ${stuck.map((s) => `${s.id} (${s.reason})`).join('; ')}.`
@@ -479,23 +511,25 @@ function diagnose(
   grid: NavGrid,
   stops: PlanStop[],
   entryCell: number,
-  reserved: ReadonlySet<number>
+  blockedFor: (done: number, keyMask: number) => Set<number>
 ): PlanOutcome['stuck'] {
   const stepIndex = new Map(level.steps.map((s, i) => [s.id, i]));
   const keyIndex = new Map(level.keys.map((k, i) => [k.id, i]));
-  const stepStop = new Map(stops.filter((s) => s.kind === 'step').map((s) => [s.id, s]));
-  const keyStop = new Map(stops.filter((s) => s.kind === 'key').map((s) => [s.id, s]));
   const seen = new Set<string>();
   const queue: Array<{ done: number; keyMask: number }> = [{ done: 0, keyMask: 0 }];
   const stepsDoneSomewhere = new Set<string>();
   const keysCollectedSomewhere = new Set<string>();
 
-  const closureFields = new Map<number, Set<number>>();
-  const reachSet = (keyMask: number): Set<number> => {
-    let s = closureFields.get(keyMask);
+  // Blocking depends on (done, keyMask) because pickups and keys clear their
+  // own cell, so the reach field must be cached per full state, not per mask.
+  const closureFields = new Map<string, Set<number>>();
+  const reachSet = (done: number, keyMask: number): Set<number> => {
+    const fieldKey = `${done}|${keyMask}`;
+    let s = closureFields.get(fieldKey);
     if (s) return s;
     const gates = keyOpenGates(level, keyMask);
     const closed = closedGateSet(grid, gates);
+    const blocked = blockedFor(done, keyMask);
     const out = new Set<number>();
     const q = [entryCell];
     const seenCells = new Set<number>([entryCell]);
@@ -510,13 +544,13 @@ function diagnose(
         const ni = nz * grid.cols + nx;
         const nc = grid.cells[ni];
         if (!nc || !nc.walkable) continue;
-        if (seenCells.has(ni) || closed.has(ni) || reserved.has(ni)) continue;
+        if (seenCells.has(ni) || closed.has(ni) || blocked.has(ni)) continue;
         if (Math.abs(nc.y - cc.y) > grid.maxStep + 1e-6) continue;
         seenCells.add(ni);
         q.push(ni);
       }
     }
-    closureFields.set(keyMask, out);
+    closureFields.set(fieldKey, out);
     return out;
   };
 
@@ -525,7 +559,7 @@ function diagnose(
     const key = `${s.done}|${s.keyMask}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    const reach = reachSet(s.keyMask);
+    const reach = reachSet(s.done, s.keyMask);
 
     for (const stop of stops) {
       if (!reach.has(stop.standCell)) continue;

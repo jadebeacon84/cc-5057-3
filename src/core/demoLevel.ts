@@ -385,6 +385,62 @@ export function zoneById(level: LevelDef, id: string): ZoneDef | undefined {
   return level.zones.find((z) => z.id === id);
 }
 
+// ------------------------------------------------- minimal ordering fixture
+//
+// A deliberately tiny multi-zone scene for ordering regressions. It keeps the
+// same shape as Amber Reach (hub → gated hall → gated vault → exit) but has a
+// single step, two keys and two one-cell-wide corridors. That makes the first
+// illegal state visible without reading a 12-stop proof, and lets tests compare
+// "pick up then pass" against "block, then try to pass".
+//
+// The corridors are intentionally one cell wide: an object that never clears
+// its cell seals the level, while a pickup frees it. True mutual key/gate locks
+// are produced by tests that force a key behind the other key's gate.
+export function makeOrderingLevel(): LevelDef {
+  return {
+    name: 'Ordering Lab — narrow corridors and key/gate dependencies',
+    grid: 1,
+    character: { radius: 0.4, walkSpeed: 4, maxStep: 0.8, interactionReach: 0.9 },
+    zones: [
+      { id: 'hub', name: 'Entry Hub', kind: 'hub', rect: [-4, -3, 0, 4], floorY: 0 },
+      { id: 'hall', name: 'Narrow Hall', kind: 'hall', rect: [0, 0.1, 10, 1.1], floorY: 0 },
+      { id: 'vault', name: 'Keyed Vault', kind: 'vault', rect: [10, -3, 20, 4], floorY: 0 },
+      { id: 'exit', name: 'One-way Exit', kind: 'lab', rect: [20, -3, 26, 4], floorY: 0, exit: true },
+    ],
+    links: [
+      { id: 'hub-hall', a: 'hub', b: 'hall', label: 'Hall mouth', kind: 'door', polyline: [[0, 0, 0.5], [0.5, 0, 0.5]], width: 1, gate: 'hall-gate' },
+      { id: 'hall-vault', a: 'hall', b: 'vault', label: 'Vault mouth', kind: 'door', polyline: [[9.5, 0, 0.5], [10, 0, 0.5]], width: 1, gate: 'vault-gate' },
+      { id: 'vault-exit', a: 'vault', b: 'exit', label: 'Exit threshold', kind: 'door', polyline: [[20, 0, 0.5], [20.5, 0, 0.5]], width: 3 },
+    ],
+    props: [],
+    keys: [
+      { id: 'hall-key', label: 'Hall Key', unlocks: ['hall-gate'], radius: 1.2, hideHint: 'hub', note: 'Opens the first corridor.' },
+      { id: 'vault-key', label: 'Vault Key', unlocks: ['vault-gate'], radius: 1.2, hideHint: 'hall', note: 'Hidden past the first gate, opens the second.' },
+    ],
+    steps: [
+      {
+        id: 'pass',
+        label: 'Take the vault seal',
+        role: 'main',
+        requiredKind: 'vault',
+        zoneHint: 'vault',
+        seq: 0,
+        depth: 0,
+        requires: [],
+        interaction: { kind: 'pickup', radius: 1.2 },
+      },
+    ],
+    constraints: [],
+    entry: [-2, 0, 0.5],
+    exitPoint: [23, 0, 0.5],
+    notes: [
+      'Minimal multi-zone ordering fixture: hub → gated hall → gated vault → exit.',
+      'The hall is one cell wide, so an object that never clears its cell seals the level.',
+      'Picking up the seal frees its cell; a talk/inspect target there would not.',
+    ],
+  };
+}
+
 export function kindLabel(kind: string): string {
   const map: Record<string, string> = {
     hub: 'Hub',
